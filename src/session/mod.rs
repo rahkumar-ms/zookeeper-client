@@ -596,12 +596,38 @@ impl Session {
     }
 
     fn send_connect(&self, depot: &mut Depot) {
+        // ClickHouse Keeper expects the initial connect handshake payload length to be
+        // either 44 (without readonly byte) or 45 (with readonly byte). This assumes a
+        // fixed 16-byte session password (length field = 16 followed by 16 bytes).
+        //
+        // The upstream Apache ZooKeeper server tolerates an empty password on the first
+        // connect (length field = 0), but ClickHouse Keeper will close the connection
+        // immediately if the length prefix (first 4 bytes) of the framed request does
+        // not evaluate to 44 or 45. For a brand new session our internal password vector
+        // is empty (capacity 16), which previously produced a shorter (29 byte) payload
+        // and thus a mismatch. We patch this by zero‑padding to 16 bytes when the current
+        // session password is not already 16 bytes long.
+        let zero_password: [u8; PASSWORD_LEN] = [0; PASSWORD_LEN];
+        let mut padded_password: [u8; PASSWORD_LEN] = [0; PASSWORD_LEN];
+        let password: &[u8] = match self.session.password.len() {
+            PASSWORD_LEN => self.session.password.as_slice(),
+            0 => &zero_password,
+            n if n < PASSWORD_LEN => {
+                // Partially filled password (unexpected); copy and pad with zeros.
+                padded_password[..n].copy_from_slice(&self.session.password);
+                &padded_password
+            },
+            _ => {
+                // Longer than 16 (unexpected); truncate to 16.
+                &self.session.password[..PASSWORD_LEN]
+            },
+        };
         let request = ConnectRequest {
             protocol_version: 0,
             last_zxid_seen: self.last_zxid,
             timeout: self.session_timeout.as_millis() as i32,
             session_id: if self.session.readonly { 0 } else { self.session.id.0 },
-            password: self.session.password.as_slice(),
+            password,
             readonly: self.is_readonly_allowed(),
         };
         debug!("sending connect request: {request:?}");
